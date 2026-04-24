@@ -586,17 +586,29 @@ class DiscordChannel(BaseChannel):
         return "\n".join(part for part in content_parts if part) or "[empty message]"
 
     @staticmethod
-    def _build_inbound_metadata(message: discord.Message) -> dict[str, str | None]:
+    def _build_inbound_metadata(message: discord.Message) -> dict[str, Any]:
         """Build metadata for inbound Discord messages."""
         reply_to = (
             str(message.reference.message_id)
             if message.reference and message.reference.message_id
             else None
         )
+        author = message.author
+        # discord.py exposes `global_name` only on User; guild Members also
+        # expose `display_name` (nickname override).
+        display_name = (
+            getattr(author, "global_name", None)
+            or getattr(author, "display_name", None)
+            or author.name
+        )
         return {
             "message_id": str(message.id),
             "guild_id": str(message.guild.id) if message.guild else None,
             "reply_to": reply_to,
+            "user_id": str(author.id),
+            "username": author.name,
+            "display_name": display_name,
+            "is_bot": bool(getattr(author, "bot", False)),
         }
 
     def _should_respond_in_group(self, message: discord.Message, content: str) -> bool:
