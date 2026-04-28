@@ -83,14 +83,37 @@ class ContextBuilder:
     def _build_runtime_context(
         channel: str | None, chat_id: str | None, timezone: str | None = None,
         session_summary: str | None = None,
+        sender_id: str | None = None,
+        username: str | None = None,
+        display_name: str | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        sender_line = ContextBuilder._format_sender_line(sender_id, username, display_name)
+        if sender_line:
+            lines.append(sender_line)
         if session_summary:
             lines += ["", "[Resumed Session]", session_summary]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
+
+    @staticmethod
+    def _format_sender_line(
+        sender_id: str | None, username: str | None, display_name: str | None
+    ) -> str | None:
+        """Render a one-line sender identity for the runtime context block."""
+        # Internal/synthetic senders carry no useful identity for the model.
+        if sender_id in (None, "", "user", "subagent", "system"):
+            return None
+        qualifiers: list[str] = []
+        if username and username != display_name:
+            qualifiers.append(f"@{username}")
+        qualifiers.append(f"id={sender_id}")
+        tail = f"({', '.join(qualifiers)})"
+        if display_name:
+            return f"Sender: {display_name} {tail}"
+        return f"Sender: {tail}"
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
@@ -139,9 +162,18 @@ class ContextBuilder:
         chat_id: str | None = None,
         current_role: str = "user",
         session_summary: str | None = None,
+        sender_id: str | None = None,
+        username: str | None = None,
+        display_name: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, session_summary=session_summary)
+        runtime_ctx = self._build_runtime_context(
+            channel, chat_id, self.timezone,
+            session_summary=session_summary,
+            sender_id=sender_id,
+            username=username,
+            display_name=display_name,
+        )
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message

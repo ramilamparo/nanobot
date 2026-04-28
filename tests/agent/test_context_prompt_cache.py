@@ -253,6 +253,79 @@ def test_build_messages_passes_channel_to_system_prompt(tmp_path) -> None:
     assert "messaging app" in system
 
 
+def test_runtime_context_includes_sender_identity(tmp_path) -> None:
+    """Sender identity reaches the model so it can distinguish users in a group chat."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="ping",
+        channel="discord",
+        chat_id="1",
+        sender_id="212661794358034432",
+        username="ramil",
+        display_name="Ramil",
+    )
+
+    user_content = messages[-1]["content"]
+    assert "Sender: Ramil (@ramil, id=212661794358034432)" in user_content
+
+
+def test_runtime_context_sender_without_display_name(tmp_path) -> None:
+    """Missing display_name should still produce a readable sender line."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="ping",
+        channel="discord",
+        chat_id="1",
+        sender_id="42",
+        username="alice",
+    )
+
+    user_content = messages[-1]["content"]
+    assert "Sender: (@alice, id=42)" in user_content
+
+
+def test_runtime_context_omits_sender_for_internal_callers(tmp_path) -> None:
+    """Internal/synthetic senders must not leak into the runtime context."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    for synthetic in ("user", "subagent", "system", None, ""):
+        messages = builder.build_messages(
+            history=[],
+            current_message="ping",
+            channel="cli",
+            chat_id="direct",
+            sender_id=synthetic,
+        )
+        assert "Sender:" not in messages[-1]["content"]
+
+
+def test_runtime_context_omits_at_when_username_equals_display_name(tmp_path) -> None:
+    """No @username qualifier when it duplicates the display name."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="ping",
+        channel="discord",
+        chat_id="1",
+        sender_id="7",
+        username="bob",
+        display_name="bob",
+    )
+
+    user_content = messages[-1]["content"]
+    assert "Sender: bob (id=7)" in user_content
+    assert "@bob" not in user_content
+
+
 def test_subagent_result_does_not_create_consecutive_assistant_messages(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)

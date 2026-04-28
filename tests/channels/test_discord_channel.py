@@ -174,6 +174,9 @@ def _make_message(
     *,
     author_id: int = 123,
     author_bot: bool = False,
+    author_name: str = "user123",
+    author_global_name: str | None = None,
+    author_display_name: str | None = None,
     channel_id: int = 456,
     parent_channel_id: int | None = None,
     message_id: int = 789,
@@ -198,7 +201,13 @@ def _make_message(
         else None
     )
     return SimpleNamespace(
-        author=SimpleNamespace(id=author_id, bot=author_bot),
+        author=SimpleNamespace(
+            id=author_id,
+            bot=author_bot,
+            name=author_name,
+            global_name=author_global_name,
+            display_name=author_display_name or author_name,
+        ),
         channel=_FakeChannel(channel_id, parent_channel_id),
         content=content,
         guild=guild,
@@ -357,7 +366,66 @@ async def test_on_message_accepts_allowlisted_dm() -> None:
 
     assert len(handled) == 1
     assert handled[0]["chat_id"] == "456"
-    assert handled[0]["metadata"] == {"message_id": "789", "guild_id": None, "reply_to": None}
+    assert handled[0]["metadata"] == {
+        "message_id": "789",
+        "guild_id": None,
+        "reply_to": None,
+        "user_id": "123",
+        "username": "user123",
+        "display_name": "user123",
+        "is_bot": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_on_message_exposes_guild_member_display_name() -> None:
+    # Guild nickname should beat the plain username when both are present.
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(
+        _make_message(
+            author_id=42,
+            author_name="alice_raw",
+            author_global_name="Alice",
+            author_display_name="Ally (guild nick)",
+        )
+    )
+
+    meta = handled[0]["metadata"]
+    assert meta["user_id"] == "42"
+    assert meta["username"] == "alice_raw"
+    # global_name wins over display_name in our resolution order.
+    assert meta["display_name"] == "Alice"
+    assert meta["is_bot"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_message_falls_back_to_display_name_when_global_name_missing() -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(
+        _make_message(
+            author_id=77,
+            author_name="bob_raw",
+            author_global_name=None,
+            author_display_name="Bobby",
+        )
+    )
+
+    meta = handled[0]["metadata"]
+    assert meta["display_name"] == "Bobby"
 
 
 @pytest.mark.asyncio

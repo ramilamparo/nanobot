@@ -1001,6 +1001,7 @@ class AgentLoop:
                 msg.content,
             )
         else:
+            inbound_meta = msg.metadata or {}
             initial_messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content,
@@ -1008,6 +1009,9 @@ class AgentLoop:
                 media=msg.media if msg.media else None,
                 channel=msg.channel,
                 chat_id=self._runtime_chat_id(msg),
+                sender_id=msg.sender_id,
+                username=inbound_meta.get("username"),
+                display_name=inbound_meta.get("display_name") or inbound_meta.get("first_name"),
             )
 
         async def _bus_progress(
