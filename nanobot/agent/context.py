@@ -3,20 +3,77 @@
 import base64
 import mimetypes
 import platform
+from contextlib import suppress
 from importlib.resources import files as pkg_files
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
-from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime, truncate_text
+from nanobot.agent.tools import mcp as mcp_tools
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.bus.events import InboundMessage
+from nanobot.cli_apps import utils as cli_app_utils
+from nanobot.session.goal_state import goal_state_runtime_lines
+from nanobot.utils.helpers import (
+    current_time_str,
+    detect_image_mime,
+    truncate_text,
+)
 from nanobot.utils.prompt_templates import render_template
+
+
+def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return persisted kwargs for turn-attached capabilities."""
+    return cli_app_utils.session_extra(metadata) | mcp_tools.session_extra(metadata)
+
+
+def runtime_lines(state: Any, msg: Any, workspace: Path, *, skip: bool = False) -> list[str]:
+    """Return model-visible runtime annotations for turn-attached capabilities."""
+    return [
+        *cli_app_utils.runtime_lines(msg, workspace, skip=skip),
+        *mcp_tools.runtime_lines(
+            msg,
+            configured_server_names=set(state._mcp_servers),
+            connected_server_names=set(state._mcp_stacks),
+            skip=skip,
+        ),
+    ]
+
+
+async def connect_mcp(state: Any, tools: ToolRegistry) -> None:
+    await mcp_tools.connect_missing_servers(state, tools)
+
+
+async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolRegistry) -> bool:
+    return await mcp_tools.handle_runtime_control(state, msg, tools)
+
+
+_SYNTHETIC_SENDER_IDS = {None, "", "user", "subagent", "system"}
+
+
+def sender_line(
+    sender_id: str | None,
+    username: str | None,
+    display_name: str | None,
+) -> str | None:
+    """Render a one-line sender identity for the runtime context block."""
+    if sender_id in _SYNTHETIC_SENDER_IDS:
+        return None
+    qualifiers: list[str] = []
+    if username and username != display_name:
+        qualifiers.append(f"@{username}")
+    qualifiers.append(f"id={sender_id}")
+    tail = f"({', '.join(qualifiers)})"
+    if display_name:
+        return f"Sender: {display_name} {tail}"
+    return f"Sender: {tail}"
 
 
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
@@ -32,6 +89,7 @@ class ContextBuilder:
         self,
         skill_names: list[str] | None = None,
         channel: str | None = None,
+        session_summary: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity(channel=channel)]
@@ -39,6 +97,8 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
+
+        parts.append(render_template("agent/tool_contract.md"))
 
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
@@ -63,6 +123,9 @@ class ContextBuilder:
             history_text = truncate_text(history_text, self._MAX_HISTORY_CHARS)
             parts.append("# Recent History\n\n" + history_text)
 
+        if session_summary:
+            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+
         return "\n\n---\n\n".join(parts)
 
     def _get_identity(self, channel: str | None = None) -> str:
@@ -81,39 +144,18 @@ class ContextBuilder:
 
     @staticmethod
     def _build_runtime_context(
-        channel: str | None, chat_id: str | None, timezone: str | None = None,
-        session_summary: str | None = None,
-        sender_id: str | None = None,
-        username: str | None = None,
-        display_name: str | None = None,
+        channel: str | None,
+        chat_id: str | None,
+        timezone: str | None = None,
+        supplemental_lines: Sequence[str] | None = None,
     ) -> str:
-        """Build untrusted runtime metadata block for injection before the user message."""
+        """Build untrusted runtime metadata block appended after user content."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
-        sender_line = ContextBuilder._format_sender_line(sender_id, username, display_name)
-        if sender_line:
-            lines.append(sender_line)
-        if session_summary:
-            lines += ["", "[Resumed Session]", session_summary]
+        if supplemental_lines:
+            lines.extend(supplemental_lines)
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
-
-    @staticmethod
-    def _format_sender_line(
-        sender_id: str | None, username: str | None, display_name: str | None
-    ) -> str | None:
-        """Render a one-line sender identity for the runtime context block."""
-        # Internal/synthetic senders carry no useful identity for the model.
-        if sender_id in (None, "", "user", "subagent", "system"):
-            return None
-        qualifiers: list[str] = []
-        if username and username != display_name:
-            qualifiers.append(f"@{username}")
-        qualifiers.append(f"id={sender_id}")
-        tail = f"({', '.join(qualifiers)})"
-        if display_name:
-            return f"Sender: {display_name} {tail}"
-        return f"Sender: {tail}"
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
@@ -144,12 +186,10 @@ class ContextBuilder:
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
         """Check if *content* is identical to the bundled template (user hasn't customized it)."""
-        try:
+        with suppress(Exception):
             tpl = pkg_files("nanobot") / "templates" / template_path
             if tpl.is_file():
                 return content.strip() == tpl.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
         return False
 
     def build_messages(
@@ -161,29 +201,38 @@ class ContextBuilder:
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
-        session_summary: str | None = None,
         sender_id: str | None = None,
         username: str | None = None,
         display_name: str | None = None,
+        session_summary: str | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
+        current_runtime_lines: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
+        extra: list[str] = [*goal_state_runtime_lines(session_metadata)]
+        if current_runtime_lines:
+            extra.extend(line for line in current_runtime_lines if line)
+        line = sender_line(sender_id, username, display_name)
+        if line:
+            extra.append(line)
         runtime_ctx = self._build_runtime_context(
-            channel, chat_id, self.timezone,
-            session_summary=session_summary,
-            sender_id=sender_id,
-            username=username,
-            display_name=display_name,
+            channel,
+            chat_id,
+            self.timezone,
+            supplemental_lines=extra or None,
         )
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
+        # Runtime context is appended to keep the user-content prefix stable
+        # for prompt-cache hits (the context changes every turn due to time).
         if isinstance(user_content, str):
-            merged = f"{runtime_ctx}\n\n{user_content}"
+            merged = f"{user_content}\n\n{runtime_ctx}"
         else:
-            merged = [{"type": "text", "text": runtime_ctx}] + user_content
+            merged = user_content + [{"type": "text", "text": runtime_ctx}]
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel, session_summary=session_summary)},
             *history,
         ]
         if messages[-1].get("role") == current_role:
@@ -218,27 +267,3 @@ class ContextBuilder:
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
-
-    def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: Any,
-    ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
-        return messages
-
-    def add_assistant_message(
-        self, messages: list[dict[str, Any]],
-        content: str | None,
-        tool_calls: list[dict[str, Any]] | None = None,
-        reasoning_content: str | None = None,
-        thinking_blocks: list[dict] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Add an assistant message to the message list."""
-        messages.append(build_assistant_message(
-            content,
-            tool_calls=tool_calls,
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        ))
-        return messages
